@@ -92,8 +92,9 @@ func (s *SearchService) Search(
 		)
 	}
 
+	// По умолчанию возвращаем 5 объявлений.
 	if params.Limit <= 0 {
-		params.Limit = 25
+		params.Limit = 5
 	}
 
 	if params.Limit > 100 {
@@ -132,9 +133,14 @@ func (s *SearchService) Search(
 		}
 
 		if found {
+
 			fmt.Printf(
 				"⚡ Cache hit: %s\n",
 				params.Query,
+			)
+
+			printRelevance(
+				cachedListings,
 			)
 
 			return cachedListings, nil
@@ -167,8 +173,6 @@ func (s *SearchService) Search(
 	// RELEVANCE
 	// =========================================================
 
-	// Рассчитываем и сохраняем рейтинг релевантности
-	// для каждого объявления.
 	for i := range listings {
 
 		listings[i].Relevance = CalculateRelevance(
@@ -177,32 +181,48 @@ func (s *SearchService) Search(
 		)
 	}
 
-	// Сортируем по рассчитанной релевантности.
 	SortByRelevance(
 		listings,
 		params.Query,
 	)
 
-	// После сортировки ещё раз гарантируем,
-	// что поле Relevance соответствует текущему
-	// порядку и значению.
-	for i := range listings {
+	// =========================================================
+	// FILTER LOW RELEVANCE
+	// =========================================================
 
-		listings[i].Relevance = CalculateRelevance(
-			listings[i],
-			params.Query,
-		)
+	filteredListings := make(
+		[]models.Listing,
+		0,
+		len(listings),
+	)
+
+	for _, listing := range listings {
+
+		if listing.Relevance > 0 {
+			filteredListings = append(
+				filteredListings,
+				listing,
+			)
+		}
 	}
+
+	listings = filteredListings
 
 	// =========================================================
 	// LIMIT
 	// =========================================================
 
-	// Ограничиваем количество результатов
-	// только после сортировки.
 	if len(listings) > params.Limit {
 		listings = listings[:params.Limit]
 	}
+
+	// =========================================================
+	// PRINT RELEVANCE
+	// =========================================================
+
+	printRelevance(
+		listings,
+	)
 
 	// =========================================================
 	// SAVE LISTINGS
@@ -248,6 +268,37 @@ func (s *SearchService) Search(
 	}
 
 	return listings, nil
+}
+
+// =============================================================
+// RELEVANCE LOG
+// =============================================================
+
+// printRelevance выводит в консоль
+// релевантность каждого объявления.
+func printRelevance(
+	listings []models.Listing,
+) {
+
+	fmt.Println("📊 Relevance:")
+
+	if len(listings) == 0 {
+		fmt.Println("  — результатов нет")
+		return
+	}
+
+	for _, listing := range listings {
+
+		title := strings.TrimSpace(
+			listing.Title,
+		)
+
+		fmt.Printf(
+			"  [%d] %s\n",
+			listing.Relevance,
+			title,
+		)
+	}
 }
 
 // =============================================================
@@ -312,7 +363,6 @@ func (s *SearchService) getCachedResults(
 		)
 	}
 
-	// Поискового запроса ещё не было.
 	if searchQuery == nil {
 		return nil, false, nil
 	}
@@ -371,8 +421,6 @@ func (s *SearchService) getCachedResults(
 	// RELEVANCE FOR CACHE
 	// =========================================================
 
-	// Relevance не хранится в БД как отдельное поле,
-	// поэтому при cache hit рассчитываем его заново.
 	for i := range listings {
 
 		listings[i].Relevance = CalculateRelevance(
@@ -381,11 +429,32 @@ func (s *SearchService) getCachedResults(
 		)
 	}
 
-	// Сортируем кэшированные объявления.
 	SortByRelevance(
 		listings,
 		params.Query,
 	)
+
+	// =========================================================
+	// FILTER LOW RELEVANCE
+	// =========================================================
+
+	filteredListings := make(
+		[]models.Listing,
+		0,
+		len(listings),
+	)
+
+	for _, listing := range listings {
+
+		if listing.Relevance > 0 {
+			filteredListings = append(
+				filteredListings,
+				listing,
+			)
+		}
+	}
+
+	listings = filteredListings
 
 	// =========================================================
 	// LIMIT

@@ -41,10 +41,6 @@ func (p *AvitoParser) Search(
 	params SearchParams,
 ) ([]models.Listing, error) {
 
-	// =========================================================
-	// VALIDATION
-	// =========================================================
-
 	params.Query = strings.TrimSpace(params.Query)
 	params.City = strings.TrimSpace(params.City)
 
@@ -52,26 +48,21 @@ func (p *AvitoParser) Search(
 		return nil, fmt.Errorf("search query is empty")
 	}
 
+	// По умолчанию берём только 5 объявлений.
 	limit := params.Limit
 
 	if limit <= 0 {
-		limit = 25
+		limit = 5
 	}
 
 	if limit > 100 {
 		limit = 100
 	}
 
-	// =========================================================
-	// BROWSER CONTEXT
-	// =========================================================
-
 	if p.browserCtx == nil {
 		return nil, fmt.Errorf("browser context is nil")
 	}
 
-	// Проверяем, что allocator/browser context
-	// ещё не был отменён.
 	select {
 	case <-p.browserCtx.Done():
 		return nil, fmt.Errorf(
@@ -81,48 +72,24 @@ func (p *AvitoParser) Search(
 	default:
 	}
 
-	// Создаём отдельный context для каждого поиска.
-	//
-	// Это важно:
-	// один запрос не должен использовать один и тот же
-	// tab/context с другим запросом.
-	searchCtx, cancel := chromedp.NewContext(
-		p.browserCtx,
-	)
-
+	searchCtx, cancel := chromedp.NewContext(p.browserCtx)
 	defer cancel()
-
-	// =========================================================
-	// SEARCH TIMEOUT
-	// =========================================================
 
 	searchCtx, timeoutCancel := context.WithTimeout(
 		searchCtx,
 		90*time.Second,
 	)
-
 	defer timeoutCancel()
 
-	// Если HTTP-запрос клиента отменился,
-	// закрываем только текущий поиск.
 	if ctx != nil {
-
 		go func() {
-
 			select {
-
 			case <-ctx.Done():
 				timeoutCancel()
-
 			case <-searchCtx.Done():
 			}
-
 		}()
 	}
-
-	// =========================================================
-	// SEARCH URL
-	// =========================================================
 
 	searchURL := buildAvitoSearchURL(
 		params.Query,
@@ -134,19 +101,10 @@ func (p *AvitoParser) Search(
 		searchURL,
 	)
 
-	// =========================================================
-	// OPEN AVITO
-	// =========================================================
-
 	err := chromedp.Run(
 		searchCtx,
-
 		chromedp.Navigate(searchURL),
-
-		// Avito использует динамический JavaScript-контент.
-		// Поэтому после Navigate ждём загрузку DOM.
 		chromedp.Sleep(8*time.Second),
-
 		chromedp.WaitVisible(
 			`[data-marker="catalog-serp"]`,
 			chromedp.ByQuery,
@@ -160,23 +118,17 @@ func (p *AvitoParser) Search(
 		)
 	}
 
-	// =========================================================
-	// SCROLL
-	// =========================================================
-
+	// Немного прокручиваем страницу,
+	// чтобы Avito загрузил дополнительные объявления.
 	for i := 0; i < 5; i++ {
 
 		err = chromedp.Run(
 			searchCtx,
-
 			chromedp.Evaluate(
 				`window.scrollTo(0, document.body.scrollHeight);`,
 				nil,
 			),
-
-			chromedp.Sleep(
-				700*time.Millisecond,
-			),
+			chromedp.Sleep(700*time.Millisecond),
 		)
 
 		if err != nil {
@@ -187,151 +139,112 @@ func (p *AvitoParser) Search(
 		}
 	}
 
-	// =========================================================
-	// EXTRACT DOM
-	// =========================================================
-
 	var rawListings []avitoRawListing
 
 	script := `
-	(() => {
+		(() => {
+			const result = [];
 
-		const result = [];
+			const cards = document.querySelectorAll(
+				'[data-marker="item"]'
+			);
 
-		const cards = document.querySelectorAll(
-			'[data-marker="item"]'
-		);
+			for (const card of cards) {
 
-		for (const card of cards) {
+				const titleElement =
+					card.querySelector('[itemprop="name"]') ||
+					card.querySelector('[data-marker="item-title"]');
 
-			// =================================================
-			// TITLE
-			// =================================================
+				const title =
+					titleElement
+						? titleElement.textContent.trim()
+						: '';
 
-			const titleElement =
-				card.querySelector('[itemprop="name"]') ||
-				card.querySelector('[data-marker="item-title"]');
+				const linkElement =
+					card.querySelector('a[href*="/avito.ru/"]') ||
+					card.querySelector('a[data-marker="item-title"]') ||
+					card.querySelector('a');
 
-			const title =
-				titleElement
-					? titleElement.textContent.trim()
-					: '';
+				const href =
+					linkElement
+						? linkElement.href
+						: '';
 
-			// =================================================
-			// LINK
-			// =================================================
+				const priceElement =
+					card.querySelector('[itemprop="price"]') ||
+					card.querySelector('[data-marker="item-price"]');
 
-			const linkElement =
-				card.querySelector('a[href*="/avito.ru/"]') ||
-				card.querySelector('a[data-marker="item-title"]') ||
-				card.querySelector('a');
+				const price =
+					priceElement
+						? (
+							priceElement.getAttribute('content') ||
+							priceElement.textContent.trim()
+						)
+						: '';
 
-			const href =
-				linkElement
-					? linkElement.href
-					: '';
+				const imageElement =
+					card.querySelector('img');
 
-			// =================================================
-			// PRICE
-			// =================================================
+				const image =
+					imageElement
+						? (
+							imageElement.src ||
+							imageElement.getAttribute('src') ||
+							''
+						)
+						: '';
 
-			const priceElement =
-				card.querySelector('[itemprop="price"]') ||
-				card.querySelector('[data-marker="item-price"]');
+				let externalId = '';
 
-			const price =
-				priceElement
-					? (
-						priceElement.getAttribute('content') ||
-						priceElement.textContent.trim()
-					)
-					: '';
+				const idElement =
+					card.querySelector('[data-item-id]');
 
-			// =================================================
-			// IMAGE
-			// =================================================
+				if (idElement) {
+					externalId =
+						idElement.getAttribute('data-item-id') || '';
+				}
 
-			const imageElement =
-				card.querySelector('img');
+				if (!externalId && href) {
 
-			const image =
-				imageElement
-					? (
-						imageElement.src ||
-						imageElement.getAttribute('src') ||
-						''
-					)
-					: '';
+					const match =
+						href.match(/_(\d+)(?:\?|$)/);
 
-			// =================================================
-			// EXTERNAL ID
-			// =================================================
+					if (match) {
+						externalId = match[1];
+					}
+				}
 
-			let externalId = '';
+				let city = '';
 
-			const idElement =
-				card.querySelector('[data-item-id]');
+				const locationElement =
+					card.querySelector(
+						'[data-marker="item-address"]'
+					);
 
-			if (idElement) {
+				if (locationElement) {
+					city =
+						locationElement.textContent.trim();
+				}
 
-				externalId =
-					idElement.getAttribute('data-item-id') || '';
-			}
+				if (title || href) {
 
-			// Если data-item-id отсутствует,
-			// пробуем получить ID из URL.
-			if (!externalId && href) {
-
-				const match =
-					href.match(/_(\d+)(?:\?|$)/);
-
-				if (match) {
-					externalId = match[1];
+					result.push({
+						externalId,
+						title,
+						href,
+						price,
+						image,
+						city
+					});
 				}
 			}
 
-			// =================================================
-			// CITY
-			// =================================================
-
-			let city = '';
-
-			const locationElement =
-				card.querySelector(
-					'[data-marker="item-address"]'
-				);
-
-			if (locationElement) {
-
-				city =
-					locationElement.textContent.trim();
-			}
-
-			// =================================================
-			// RESULT
-			// =================================================
-
-			if (title || href) {
-
-				result.push({
-					externalId,
-					title,
-					href,
-					price,
-					image,
-					city
-				});
-			}
-		}
-
-		return result;
-
-	})()
+			return result;
+		})()
 	`
 
 	err = chromedp.Run(
 		searchCtx,
-
 		chromedp.Evaluate(
 			script,
 			&rawListings,
@@ -345,17 +258,17 @@ func (p *AvitoParser) Search(
 		)
 	}
 
-	// =========================================================
-	// EMPTY RESULT
-	// =========================================================
-
 	if len(rawListings) == 0 {
+		fmt.Println("⚠️ Avito: объявления не найдены")
+
 		return []models.Listing{}, nil
 	}
 
-	// =========================================================
-	// CONVERT TO MODELS.LISTING
-	// =========================================================
+	// Ограничиваем количество объявлений
+	// непосредственно после получения результатов поиска.
+	if len(rawListings) > limit {
+		rawListings = rawListings[:limit]
+	}
 
 	listings := make(
 		[]models.Listing,
@@ -365,60 +278,34 @@ func (p *AvitoParser) Search(
 
 	for _, raw := range rawListings {
 
-		// =====================================================
-		// EXTERNAL ID
-		// =====================================================
-
 		externalID := strings.TrimSpace(
 			raw.ExternalID,
 		)
 
 		if externalID == "" {
-
 			externalID = extractAvitoID(
 				raw.Href,
 			)
 		}
 
-		// Объявление без ID и URL нам не подходит.
 		if externalID == "" ||
 			strings.TrimSpace(raw.Href) == "" {
 
 			continue
 		}
 
-		// =====================================================
-		// CITY
-		// =====================================================
-
 		city := strings.TrimSpace(
 			raw.City,
 		)
 
 		if city == "" {
-
 			city = extractAvitoCity(
 				raw.Href,
 			)
 		}
 
-		// =====================================================
-		// PRICE
-		// =====================================================
-
-		price := parsePrice(
-			raw.Price,
-		)
-
-		// =====================================================
-		// TIME
-		// =====================================================
-
+		price := parsePrice(raw.Price)
 		now := time.Now()
-
-		// =====================================================
-		// LISTING
-		// =====================================================
 
 		listing := models.Listing{
 			SourceID:    1,
@@ -441,11 +328,6 @@ func (p *AvitoParser) Search(
 			listings,
 			listing,
 		)
-
-		// Ограничиваем количество результатов.
-		if len(listings) >= limit {
-			break
-		}
 	}
 
 	fmt.Printf(
@@ -456,27 +338,18 @@ func (p *AvitoParser) Search(
 	return listings, nil
 }
 
-// =============================================================
-// EXTRACT CITY
-// =============================================================
-
 func extractAvitoCity(
 	rawURL string,
 ) string {
 
-	u, err := url.Parse(
-		rawURL,
-	)
+	u, err := url.Parse(rawURL)
 
 	if err != nil {
 		return ""
 	}
 
 	parts := strings.Split(
-		strings.Trim(
-			u.Path,
-			"/",
-		),
+		strings.Trim(u.Path, "/"),
 		"/",
 	)
 
@@ -489,10 +362,6 @@ func extractAvitoCity(
 	)
 }
 
-// =============================================================
-// EXTRACT ID
-// =============================================================
-
 func extractAvitoID(
 	rawURL string,
 ) string {
@@ -501,19 +370,14 @@ func extractAvitoID(
 		return ""
 	}
 
-	u, err := url.Parse(
-		rawURL,
-	)
+	u, err := url.Parse(rawURL)
 
 	if err != nil {
 		return ""
 	}
 
 	parts := strings.Split(
-		strings.Trim(
-			u.Path,
-			"/",
-		),
+		strings.Trim(u.Path, "/"),
 		"/",
 	)
 
@@ -522,14 +386,6 @@ func extractAvitoID(
 	}
 
 	lastPart := parts[len(parts)-1]
-
-	// ID обычно находится после последнего "_".
-	//
-	// Например:
-	//
-	// kolodki-bmw-e90_8231402426
-	//
-	// -> 8231402426
 
 	for i := len(lastPart) - 1; i >= 0; i-- {
 
@@ -553,17 +409,11 @@ func extractAvitoID(
 	return ""
 }
 
-// =============================================================
-// PARSE PRICE
-// =============================================================
-
 func parsePrice(
 	raw string,
 ) *int64 {
 
-	raw = strings.TrimSpace(
-		raw,
-	)
+	raw = strings.TrimSpace(raw)
 
 	if raw == "" {
 		return nil
@@ -595,34 +445,19 @@ func parsePrice(
 	return &value
 }
 
-// =============================================================
-// BUILD AVITO SEARCH URL
-// =============================================================
-
 func buildAvitoSearchURL(
 	query string,
 	city string,
 ) string {
 
-	query = strings.TrimSpace(
-		query,
-	)
+	query = strings.TrimSpace(query)
+	city = strings.TrimSpace(city)
 
-	city = strings.TrimSpace(
-		city,
-	)
+	encodedQuery := url.QueryEscape(query)
 
-	encodedQuery := url.QueryEscape(
-		query,
-	)
-
-	// Если пользователь передал город,
-	// ищем непосредственно в этом регионе.
 	if city != "" {
 
-		city = strings.ToLower(
-			city,
-		)
+		city = strings.ToLower(city)
 
 		return fmt.Sprintf(
 			"https://www.avito.ru/%s?q=%s",
@@ -631,8 +466,6 @@ func buildAvitoSearchURL(
 		)
 	}
 
-	// Если город не указан,
-	// ищем по всей России.
 	return fmt.Sprintf(
 		"https://www.avito.ru/rossiya?q=%s",
 		encodedQuery,

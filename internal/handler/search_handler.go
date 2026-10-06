@@ -91,7 +91,7 @@ func (h *SearchHandler) Search(
 	// LIMIT
 	// =========================
 
-	limit := 25
+	limit := 5
 
 	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
 
