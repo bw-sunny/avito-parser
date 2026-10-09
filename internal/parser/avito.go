@@ -4,17 +4,19 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"avito-parser/internal/browser"
 	"avito-parser/internal/models"
 
 	"github.com/chromedp/chromedp"
 )
 
 type AvitoParser struct {
-	browserCtx context.Context
+	browser *browser.Manager
 }
 
 type avitoRawListing struct {
@@ -26,9 +28,9 @@ type avitoRawListing struct {
 	City       string `json:"city"`
 }
 
-func NewAvitoParser(ctx context.Context) *AvitoParser {
+func NewAvitoParser(b *browser.Manager) *AvitoParser {
 	return &AvitoParser{
-		browserCtx: ctx,
+		browser: b,
 	}
 }
 
@@ -59,36 +61,8 @@ func (p *AvitoParser) Search(
 		limit = 100
 	}
 
-	if p.browserCtx == nil {
-		return nil, fmt.Errorf("browser context is nil")
-	}
-
-	select {
-	case <-p.browserCtx.Done():
-		return nil, fmt.Errorf(
-			"browser context is already closed: %w",
-			p.browserCtx.Err(),
-		)
-	default:
-	}
-
-	searchCtx, cancel := chromedp.NewContext(p.browserCtx)
-	defer cancel()
-
-	searchCtx, timeoutCancel := context.WithTimeout(
-		searchCtx,
-		90*time.Second,
-	)
-	defer timeoutCancel()
-
-	if ctx != nil {
-		go func() {
-			select {
-			case <-ctx.Done():
-				timeoutCancel()
-			case <-searchCtx.Done():
-			}
-		}()
+	if p.browser == nil {
+		return nil, fmt.Errorf("browser manager is nil")
 	}
 
 	searchURL := buildAvitoSearchURL(
@@ -101,47 +75,162 @@ func (p *AvitoParser) Search(
 		searchURL,
 	)
 
-	err := chromedp.Run(
-		searchCtx,
-		chromedp.Navigate(searchURL),
-		chromedp.Sleep(8*time.Second),
-		chromedp.WaitVisible(
-			`[data-marker="catalog-serp"]`,
-			chromedp.ByQuery,
-		),
-	)
+	var rawListings []avitoRawListing
 
-	if err != nil {
-		return nil, fmt.Errorf(
-			"open Avito search page: %w",
-			err,
-		)
-	}
+	err := p.browser.Tab(ctx, SearchTabTimeout, func(searchCtx context.Context) error {
 
-	// Немного прокручиваем страницу,
-	// чтобы Avito загрузил дополнительные объявления.
-	for i := 0; i < 5; i++ {
-
-		err = chromedp.Run(
+		err := chromedp.Run(
 			searchCtx,
-			chromedp.Evaluate(
-				`window.scrollTo(0, document.body.scrollHeight);`,
-				nil,
-			),
-			chromedp.Sleep(700*time.Millisecond),
+			chromedp.Navigate(searchURL),
+			chromedp.Sleep(8*time.Second),
 		)
 
 		if err != nil {
-			return nil, fmt.Errorf(
-				"scroll Avito page: %w",
-				err,
-			)
+			return fmt.Errorf("open Avito search page: %w", err)
 		}
+
+		// Капчу проверяем до ожидания целевого селектора: на
+		// капче его никогда не будет, и без этой проверки
+		// WaitVisible просто откатится по таймауту с невнятной
+		// ошибкой вместо чёткого browser.ErrCaptcha.
+		isCaptcha, err := browser.DetectCaptcha(searchCtx)
+
+		if err != nil {
+			return fmt.Errorf("detect captcha: %w", err)
+		}
+
+		if isCaptcha {
+
+			if err := waitOrFailCaptcha(p.browser, searchCtx, "Avito"); err != nil {
+				return err
+			}
+		}
+
+		err = chromedp.Run(
+			searchCtx,
+			chromedp.WaitVisible(
+				`[data-marker="catalog-serp"]`,
+				chromedp.ByQuery,
+			),
+		)
+
+		if err != nil {
+			return fmt.Errorf("wait Avito search results: %w", err)
+		}
+
+		// Немного прокручиваем страницу,
+		// чтобы Avito загрузил дополнительные объявления.
+		for i := 0; i < 5; i++ {
+
+			err = chromedp.Run(
+				searchCtx,
+				chromedp.Evaluate(
+					`window.scrollTo(0, document.body.scrollHeight);`,
+					nil,
+				),
+				chromedp.Sleep(700*time.Millisecond),
+			)
+
+			if err != nil {
+				return fmt.Errorf("scroll Avito page: %w", err)
+			}
+		}
+
+		return chromedp.Run(
+			searchCtx,
+			chromedp.Evaluate(avitoExtractScript, &rawListings),
+		)
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("avito: %w", err)
 	}
 
-	var rawListings []avitoRawListing
+	if len(rawListings) == 0 {
+		fmt.Println("⚠️ Avito: объявления не найдены")
 
-	script := `
+		return []models.Listing{}, nil
+	}
+
+	// Ограничиваем количество объявлений
+	// непосредственно после получения результатов поиска.
+	if len(rawListings) > limit {
+		rawListings = rawListings[:limit]
+	}
+
+	listings := make(
+		[]models.Listing,
+		0,
+		len(rawListings),
+	)
+
+	for _, raw := range rawListings {
+
+		externalID := strings.TrimSpace(
+			raw.ExternalID,
+		)
+
+		if externalID == "" {
+			externalID = extractAvitoID(
+				raw.Href,
+			)
+		}
+
+		if externalID == "" ||
+			strings.TrimSpace(raw.Href) == "" {
+
+			continue
+		}
+
+		city := strings.TrimSpace(
+			raw.City,
+		)
+
+		if city == "" {
+			city = extractAvitoCity(
+				raw.Href,
+			)
+		}
+
+		price := parsePrice(raw.Price)
+		now := time.Now()
+
+		listing := models.Listing{
+			// SourceID проставляет SearchService после парсинга —
+			// см. search_service.go. Парсер не обязан знать ID
+			// источника в БД, только свой код через Name().
+			ExternalID:  externalID,
+			Title:       strings.TrimSpace(raw.Title),
+			Description: "",
+			Price:       price,
+			Currency:    "RUB",
+			URL:         strings.TrimSpace(raw.Href),
+			City:        city,
+			Region:      "",
+			SellerType:  "",
+			Condition:   "",
+			IsAvailable: true,
+			ParsedAt:    now,
+			UpdatedAt:   now,
+		}
+
+		listings = append(
+			listings,
+			listing,
+		)
+	}
+
+	fmt.Printf(
+		"✅ Avito: найдено %d объявлений\n",
+		len(listings),
+	)
+
+	return listings, nil
+}
+
+// avitoExtractScript — старое тело script внутри Search() вынесено
+// в константу, т.к. само извлечение теперь вызывается из замыкания.
+const avitoExtractScript = `
 		(() => {
 			const result = [];
 
@@ -243,101 +332,6 @@ func (p *AvitoParser) Search(
 		})()
 	`
 
-	err = chromedp.Run(
-		searchCtx,
-		chromedp.Evaluate(
-			script,
-			&rawListings,
-		),
-	)
-
-	if err != nil {
-		return nil, fmt.Errorf(
-			"extract Avito listings: %w",
-			err,
-		)
-	}
-
-	if len(rawListings) == 0 {
-		fmt.Println("⚠️ Avito: объявления не найдены")
-
-		return []models.Listing{}, nil
-	}
-
-	// Ограничиваем количество объявлений
-	// непосредственно после получения результатов поиска.
-	if len(rawListings) > limit {
-		rawListings = rawListings[:limit]
-	}
-
-	listings := make(
-		[]models.Listing,
-		0,
-		len(rawListings),
-	)
-
-	for _, raw := range rawListings {
-
-		externalID := strings.TrimSpace(
-			raw.ExternalID,
-		)
-
-		if externalID == "" {
-			externalID = extractAvitoID(
-				raw.Href,
-			)
-		}
-
-		if externalID == "" ||
-			strings.TrimSpace(raw.Href) == "" {
-
-			continue
-		}
-
-		city := strings.TrimSpace(
-			raw.City,
-		)
-
-		if city == "" {
-			city = extractAvitoCity(
-				raw.Href,
-			)
-		}
-
-		price := parsePrice(raw.Price)
-		now := time.Now()
-
-		listing := models.Listing{
-			SourceID:    1,
-			ExternalID:  externalID,
-			Title:       strings.TrimSpace(raw.Title),
-			Description: "",
-			Price:       price,
-			Currency:    "RUB",
-			URL:         strings.TrimSpace(raw.Href),
-			City:        city,
-			Region:      "",
-			SellerType:  "",
-			Condition:   "",
-			IsAvailable: true,
-			ParsedAt:    now,
-			UpdatedAt:   now,
-		}
-
-		listings = append(
-			listings,
-			listing,
-		)
-	}
-
-	fmt.Printf(
-		"✅ Avito: найдено %d объявлений\n",
-		len(listings),
-	)
-
-	return listings, nil
-}
-
 func extractAvitoCity(
 	rawURL string,
 ) string {
@@ -409,6 +403,18 @@ func extractAvitoID(
 	return ""
 }
 
+// kopecksSuffixPattern вырезает копейки перед тем, как парсить
+// цену как целые рубли.
+//
+// БАГ, который это чинит: сырая цена с Drom вида "9 002,40 ₽"
+// (9002 рубля 40 копеек) раньше превращалась в 900240, потому что
+// старый parsePrice просто выдёргивал ВСЕ цифры подряд, не отличая
+// разделитель копеек от обычной цифры суммы — "9 002,40" давало
+// цифры "9", "0", "0", "2", "4", "0" подряд = 900240 вместо 9002.
+// Теперь сначала вырезаем ",40"/".40" на конце числа (оставляя то,
+// что шло после, например " ₽"), и только потом считаем цифры.
+var kopecksSuffixPattern = regexp.MustCompile(`[.,]\d{2}(\D*)$`)
+
 func parsePrice(
 	raw string,
 ) *int64 {
@@ -418,6 +424,8 @@ func parsePrice(
 	if raw == "" {
 		return nil
 	}
+
+	raw = kopecksSuffixPattern.ReplaceAllString(raw, "$1")
 
 	var digits strings.Builder
 

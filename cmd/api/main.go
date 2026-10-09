@@ -1,20 +1,18 @@
 package main
 
 import (
-	"context"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"time"
 
+	"avito-parser/internal/browser"
 	"avito-parser/internal/database"
 	"avito-parser/internal/handler"
 	"avito-parser/internal/parser"
 	"avito-parser/internal/repository"
 	"avito-parser/internal/service"
-
-	"github.com/chromedp/chromedp"
 )
 
 func main() {
@@ -68,48 +66,66 @@ func main() {
 	)
 
 	// =========================
-	// CHROMEDP
+	// BROWSER MANAGER
+	//
+	// Один процесс Chromium на всё приложение вместо нового
+	// процесса на каждый поиск — см. internal/browser/manager.go.
+	// Это нужно, чтобы куки пройденной капчи переживали отдельный
+	// запрос, а не умирали вместе с ним.
 	// =========================
 
-	opts := append(
-		chromedp.DefaultExecAllocatorOptions[:],
+	userDataDir := os.Getenv("BROWSER_USER_DATA_DIR")
 
-		chromedp.ExecPath(browserPath),
+	if userDataDir == "" {
+		log.Println(
+			"⚠️ BROWSER_USER_DATA_DIR не задан — профиль Chromium " +
+				"(и куки пройденной капчи) не переживут рестарт процесса",
+		)
+	}
 
-		chromedp.Flag(
-			"headless",
-			headless,
-		),
+	maxTabs := getEnvInt("BROWSER_MAX_TABS", 2)
 
-		chromedp.Flag(
-			"disable-gpu",
-			headless,
-		),
+	browserManager, err := browser.NewManager(browser.Options{
+		BrowserPath:       browserPath,
+		Headless:          headless,
+		UserDataDir:       userDataDir,
+		MaxConcurrentTabs: maxTabs,
+	})
 
-		chromedp.Flag(
-			"no-sandbox",
-			true,
-		),
+	if err != nil {
+		log.Fatal(err)
+	}
 
-		chromedp.Flag(
-			"disable-dev-shm-usage",
-			true,
-		),
-	)
-
-	allocCtx, cancel := chromedp.NewExecAllocator(
-		context.Background(),
-		opts...,
-	)
-
-	defer cancel()
+	defer browserManager.Close()
 
 	// =========================
-	// AVITO PARSER
+	// PARSERS
 	// =========================
 
 	avitoParser := parser.NewAvitoParser(
-		allocCtx,
+		browserManager,
+	)
+
+	dromParser := parser.NewDromParser(
+		browserManager,
+	)
+
+	// AutoDoc: его страница поиска запрещена в robots.txt (см.
+	// internal/parser/autodoc.go) — это не капча, которую можно
+	// пройти, а прямой запрет, который детектор капчи не обходит.
+	// По умолчанию выключен; включается осознанно одной переменной.
+	autodocEnabled := getEnvBool("AUTODOC_IGNORE_ROBOTS", false)
+
+	if autodocEnabled {
+		log.Println(
+			"⚠️ AUTODOC_IGNORE_ROBOTS=true — AutoDoc будет парситься " +
+				"несмотря на запрет в robots.txt, это осознанный риск",
+		)
+	}
+
+	autodocParser := parser.NewAutoDocParser(
+		browserManager,
+		autodocEnabled,
 	)
 
 	// =========================
@@ -122,6 +138,8 @@ func main() {
 		searchQueryRepository,
 		searchQueryResultRepository,
 		avitoParser,
+		dromParser,
+		autodocParser,
 	)
 	// =========================
 	// HTTP HANDLER
@@ -208,6 +226,33 @@ func getEnvBool(
 	if err != nil {
 		log.Printf(
 			"⚠️ Invalid %s=%q, using default: %t",
+			key,
+			value,
+			defaultValue,
+		)
+
+		return defaultValue
+	}
+
+	return parsed
+}
+
+func getEnvInt(
+	key string,
+	defaultValue int,
+) int {
+
+	value := os.Getenv(key)
+
+	if value == "" {
+		return defaultValue
+	}
+
+	parsed, err := strconv.Atoi(value)
+
+	if err != nil {
+		log.Printf(
+			"⚠️ Invalid %s=%q, using default: %d",
 			key,
 			value,
 			defaultValue,
